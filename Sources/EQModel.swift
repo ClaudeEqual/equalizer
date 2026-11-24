@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 import Combine
 import CoreAudio
 
@@ -55,6 +56,10 @@ final class EQModel: ObservableObject {
     private let defaults = UserDefaults.standard
     private var restartWork: DispatchWorkItem?
     private var deviceListener: AudioObjectPropertyListenerBlock?
+    private var permissionTimer: Timer?
+    private var permissionGranted = false
+    private var requestingPermission = false
+    private var wakeObserver: NSObjectProtocol?
 
     init() {
         let defaults = UserDefaults.standard
@@ -73,6 +78,10 @@ final class EQModel: ObservableObject {
 
         engine.onNeedsRestart = { [weak self] in self?.scheduleRestart() }
         listenForDeviceChanges()
+        // After sleep the audio hardware is re-created: rebuild the audio path.
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+        ) { [weak self] _ in self?.scheduleRestart() }
         pushParameters()
         applyPower()
     }
@@ -162,6 +171,45 @@ final class EQModel: ObservableObject {
 
     private func applyPower() {
         restartWork?.cancel()
+        permissionTimer?.invalidate()
+        permissionTimer = nil
+        if isOn && !permissionGranted {
+            // Without access a tap gives silence and mutes the Mac, so never start it before access is given.
+            switch AudioCapturePermission.status() {
+            case .authorized:
+                permissionGranted = true
+            case .denied:
+                engine.stop()
+                showNoPermission()
+                return
+            case .unknown:
+                guard !requestingPermission else { return }
+                requestingPermission = true
+                engine.stop()
+                status = "Нажмите «Разрешить» в появившемся окне"
+                isError = false
+                AudioCapturePermission.request { [weak self] granted in
+                    guard let self else { return }
+                    self.requestingPermission = false
+                    if granted {
+                        self.permissionGranted = true
+                        self.applyPower()
+                    } else {
+                        self.showNoPermission()
+                    }
+                }
+                // If the system never answers, start anyway after 30 s: the tap then asks by itself.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [weak self] in
+                    guard let self, self.requestingPermission else { return }
+                    self.requestingPermission = false
+                    self.permissionGranted = true
+                    self.applyPower()
+                }
+                return
+            case .unavailable:
+                break // cannot check: the system will ask by itself when the tap starts
+            }
+        }
         if isOn {
             do {
                 try engine.start()
@@ -176,6 +224,23 @@ final class EQModel: ObservableObject {
             engine.stop()
             status = "Выключен: звук идёт как обычно"
             isError = false
+        }
+    }
+
+    private func showNoPermission() {
+        status = "Нет доступа к звуку. Нажмите «Нет звука?» и включите Equalizer"
+        isError = true
+        // Start by itself as soon as access is given in System Settings.
+        permissionTimer?.invalidate()
+        permissionTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            if !self.isOn {
+                self.permissionTimer?.invalidate()
+                self.permissionTimer = nil
+            } else if AudioCapturePermission.status() == .authorized {
+                self.permissionGranted = true
+                self.applyPower()
+            }
         }
     }
 
