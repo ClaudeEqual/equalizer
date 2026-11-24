@@ -1,0 +1,33 @@
+name: Build Equalizer
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build app and dmg
+        run: bash build.sh
+
+      - name: Upload dmg (backup copy)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Equalizer
+          path: build/Equalizer.dmg
+
+      - name: Publish release with dmg
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v1.0.${{ github.run_number }}" build/Equalizer.dmg \
+            --title "Эквалайзер, сборка ${{ github.run_number }}" \
+            --notes "Скачайте файл Equalizer.dmg ниже, откройте его и перетащите Эквалайзер в папку «Программы»." \
+            --latest
