@@ -114,16 +114,16 @@ final class EQModel: ObservableObject {
         let targets = gains.map { min(max($0, Self.range.lowerBound), Self.range.upperBound) }
 
         // Neighbouring bands overlap, so the real sound differs from the slider values.
-        // Adjust the internal filter gains until the response at each band matches its slider.
-        var internal = targets
+        // Adjust the filter gains until the response at each band matches its slider.
+        var adjusted = targets
         for _ in 0..<12 {
-            let c = Self.filters(internal, sampleRate: sr)
-            for i in 0..<internal.count {
+            let c = Self.filters(adjusted, sampleRate: sr)
+            for i in 0..<adjusted.count {
                 let actual = Self.responseDB(c, at: Self.frequencies[i], sampleRate: sr)
-                internal[i] = min(max(internal[i] + 0.8 * (targets[i] - actual), -24), 24)
+                adjusted[i] = min(max(adjusted[i] + 0.8 * (targets[i] - actual), -24), 24)
             }
         }
-        let coeffs = Self.filters(internal, sampleRate: sr)
+        let coeffs = Self.filters(adjusted, sampleRate: sr)
 
         // Lower the overall level a bit when boosting, so the limiter rarely has to work.
         let maxBoost = max(0, targets.max() ?? 0)
