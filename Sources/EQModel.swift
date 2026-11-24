@@ -111,23 +111,53 @@ final class EQModel: ObservableObject {
 
     private func pushParameters() {
         let sr = engine.sampleRate
-        var coeffs: [BiquadCoefficients] = []
-        for (i, f) in Self.frequencies.enumerated() {
-            let g = min(max(gains[i], Self.range.lowerBound), Self.range.upperBound)
-            let kind: FilterKind
-            let q: Double
-            if i == 0 {
-                kind = .lowShelf; q = 0.707
-            } else if i == Self.frequencies.count - 1 {
-                kind = .highShelf; q = 0.707
-            } else {
-                kind = .peak; q = 1.41
+        let targets = gains.map { min(max($0, Self.range.lowerBound), Self.range.upperBound) }
+
+        // Neighbouring bands overlap, so the real sound differs from the slider values.
+        // Adjust the internal filter gains until the response at each band matches its slider.
+        var internal = targets
+        for _ in 0..<12 {
+            let c = Self.filters(internal, sampleRate: sr)
+            for i in 0..<internal.count {
+                let actual = Self.responseDB(c, at: Self.frequencies[i], sampleRate: sr)
+                internal[i] = min(max(internal[i] + 0.8 * (targets[i] - actual), -24), 24)
             }
-            coeffs.append(makeBiquad(kind: kind, frequency: f, gainDB: g, q: q, sampleRate: sr))
         }
+        let coeffs = Self.filters(internal, sampleRate: sr)
+
         // Lower the overall level a bit when boosting, so the limiter rarely has to work.
-        let maxBoost = max(0, gains.max() ?? 0)
+        let maxBoost = max(0, targets.max() ?? 0)
         engine.processor.setParameters(coeffs, preampDB: -0.6 * maxBoost)
+    }
+
+    /// Lowest band is a bass shelf, highest a treble shelf, the rest are peaks.
+    private static func filters(_ g: [Double], sampleRate sr: Double) -> [BiquadCoefficients] {
+        var out: [BiquadCoefficients] = []
+        for i in 0..<g.count {
+            if i == 0 {
+                out.append(makeBiquad(kind: .lowShelf, frequency: 45, gainDB: g[i], q: 0.707, sampleRate: sr))
+            } else if i == g.count - 1 {
+                out.append(makeBiquad(kind: .highShelf, frequency: 11_300, gainDB: g[i], q: 0.707, sampleRate: sr))
+            } else {
+                out.append(makeBiquad(kind: .peak, frequency: frequencies[i], gainDB: g[i], q: 1.41, sampleRate: sr))
+            }
+        }
+        return out
+    }
+
+    /// Combined level (dB) of all filters at frequency f.
+    private static func responseDB(_ filters: [BiquadCoefficients], at f: Double, sampleRate sr: Double) -> Double {
+        let w = 2 * Double.pi * min(f, sr * 0.49) / sr
+        let c1 = cos(w), s1 = -sin(w), c2 = cos(2 * w), s2 = -sin(2 * w)
+        var power = 1.0
+        for k in filters {
+            let nr = k.b0 + k.b1 * c1 + k.b2 * c2
+            let ni = k.b1 * s1 + k.b2 * s2
+            let dr = 1 + k.a1 * c1 + k.a2 * c2
+            let di = k.a1 * s1 + k.a2 * s2
+            power *= (nr * nr + ni * ni) / max(dr * dr + di * di, 1e-30)
+        }
+        return 10 * log10(max(power, 1e-30))
     }
 
     private func applyPower() {
