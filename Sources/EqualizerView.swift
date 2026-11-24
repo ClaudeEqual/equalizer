@@ -2,12 +2,14 @@ import SwiftUI
 import AppKit
 import ServiceManagement
 
-private let bandWidth: CGFloat = 50
-private let sliderHeight: CGFloat = 210
+private let compactWidth: CGFloat = 540   // menu bar panel
+private let compactTrack: CGFloat = 210   // slider track height in the menu bar panel
 
 struct EqualizerView: View {
     @ObservedObject var model: EQModel
     var showsQuit = false
+    /// true for the main window: it can be resized and opened full screen, sliders grow with it.
+    var fillsWindow = false
 
     @State private var isSaving = false
     @State private var newPresetName = ""
@@ -24,7 +26,14 @@ struct EqualizerView: View {
             footer
         }
         .padding(20)
-        .frame(width: bandWidth * CGFloat(EQModel.frequencies.count) + 40)
+        .frame(maxWidth: fillsWindow ? 1100 : compactWidth)
+        .frame(minWidth: fillsWindow ? 560 : compactWidth,
+               maxWidth: fillsWindow ? .infinity : compactWidth,
+               minHeight: fillsWindow ? 640 : nil,
+               maxHeight: fillsWindow ? .infinity : nil,
+               alignment: .top)
+        // Dragging inside the window must move sliders, never the window itself.
+        .background(NoWindowDrag())
     }
 
     // MARK: Header
@@ -124,24 +133,33 @@ struct EqualizerView: View {
                     .frame(height: 1)
                 HStack(spacing: 0) {
                     ForEach(0..<EQModel.frequencies.count, id: \.self) { i in
-                        BandSlider(value: $model.gains[i], label: EQModel.labels[i])
-                            .frame(width: bandWidth)
+                        BandSlider(value: $model.gains[i],
+                                   label: EQModel.labels[i],
+                                   trackHeight: fillsWindow ? nil : compactTrack)
+                            .frame(maxWidth: .infinity)
                     }
                 }
             }
-            HStack(spacing: 0) {
-                groupLabel("Низкие (бас)", bands: 3)
-                groupLabel("Средние", bands: 4)
-                groupLabel("Высокие", bands: 3)
+            .frame(maxHeight: fillsWindow ? .infinity : nil)
+            GeometryReader { geo in
+                let band = geo.size.width / CGFloat(EQModel.frequencies.count)
+                HStack(spacing: 0) {
+                    groupLabel("Низкие (бас)", width: band * 3)
+                    groupLabel("Средние", width: band * 4)
+                    groupLabel("Высокие", width: band * 3)
+                }
             }
+            .frame(height: 22)
             Text("Тяните кружок вверх или вниз. Двойной клик по ползунку вернёт его в ноль.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity)
         }
+        .frame(maxHeight: fillsWindow ? .infinity : nil)
+        .layoutPriority(1)
     }
 
-    private func groupLabel(_ text: String, bands: Int) -> some View {
+    private func groupLabel(_ text: String, width: CGFloat) -> some View {
         VStack(spacing: 3) {
             RoundedRectangle(cornerRadius: 1)
                 .fill(Color.secondary.opacity(0.4))
@@ -149,7 +167,7 @@ struct EqualizerView: View {
                 .padding(.horizontal, 6)
             Text(text).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
         }
-        .frame(width: bandWidth * CGFloat(bands))
+        .frame(width: max(width, 0))
     }
 
     // MARK: Footer
@@ -180,6 +198,21 @@ struct EqualizerView: View {
 
 // MARK: - Components
 
+/// Makes sure the window is never moved by dragging its content (only by its title bar).
+struct NoWindowDrag: NSViewRepresentable {
+    final class Guard: NSView {
+        override var mouseDownCanMoveWindow: Bool { false }
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            window?.isMovableByWindowBackground = false
+        }
+    }
+    func makeNSView(context: Context) -> NSView { Guard() }
+    func updateNSView(_ nsView: NSView, context: Context) {
+        nsView.window?.isMovableByWindowBackground = false
+    }
+}
+
 struct PresetButton: View {
     let title: String
     let selected: Bool
@@ -206,9 +239,14 @@ struct PresetButton: View {
 struct BandSlider: View {
     @Binding var value: Double
     let label: String
+    /// nil = grow with the window.
+    var trackHeight: CGFloat? = nil
 
     private let range = EQModel.range
-    private let knob: CGFloat = 20
+    private let knob: CGFloat = 22
+
+    /// Set while the knob itself is being dragged: it then moves smoothly from where it was, without jumping.
+    @State private var dragStart: (value: Double, y: CGFloat)? = nil
 
     var body: some View {
         VStack(spacing: 4) {
@@ -224,7 +262,7 @@ struct BandSlider: View {
                 ZStack {
                     Capsule()
                         .fill(Color.secondary.opacity(0.2))
-                        .frame(width: 6, height: h - knob)
+                        .frame(width: 6, height: max(h - knob, 0))
                         .position(x: w / 2, y: h / 2)
                     Capsule()
                         .fill(Color.accentColor)
@@ -240,11 +278,30 @@ struct BandSlider: View {
                 .contentShape(Rectangle())
                 .gesture(
                     DragGesture(minimumDistance: 0)
-                        .onChanged { g in value = valueFor(y: g.location.y, height: h) }
+                        .onChanged { g in
+                            if dragStart == nil {
+                                let startY = g.startLocation.y
+                                if abs(startY - y) <= knob {
+                                    // Grabbed the knob: follow the finger from the current value.
+                                    dragStart = (value, startY)
+                                } else {
+                                    // Clicked the track: jump there, then follow.
+                                    let v = valueFor(y: startY, height: h)
+                                    value = v
+                                    dragStart = (v, startY)
+                                }
+                            }
+                            if let s = dragStart {
+                                let perPoint = (range.upperBound - range.lowerBound) / Double(max(h - knob, 1))
+                                let raw = s.value + Double(s.y - g.location.y) * perPoint
+                                value = clampStep(raw)
+                            }
+                        }
+                        .onEnded { _ in dragStart = nil }
                 )
                 .simultaneousGesture(TapGesture(count: 2).onEnded { value = 0 })
             }
-            .frame(height: sliderHeight)
+            .frame(minHeight: trackHeight ?? compactTrack, maxHeight: trackHeight ?? .infinity)
             Text(label)
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -256,6 +313,11 @@ struct BandSlider: View {
         return String(format: "%+g", value)
     }
 
+    private func clampStep(_ raw: Double) -> Double {
+        let stepped = (raw * 2).rounded() / 2 // 0.5 dB steps
+        return min(max(stepped, range.lowerBound), range.upperBound)
+    }
+
     private func yPosition(for v: Double, height h: CGFloat) -> CGFloat {
         let usable = h - knob
         let norm = (v - range.lowerBound) / (range.upperBound - range.lowerBound)
@@ -265,8 +327,6 @@ struct BandSlider: View {
     private func valueFor(y: CGFloat, height h: CGFloat) -> Double {
         let usable = max(h - knob, 1)
         let norm = 1 - Double((y - knob / 2) / usable)
-        let raw = range.lowerBound + norm * (range.upperBound - range.lowerBound)
-        let stepped = (raw * 2).rounded() / 2 // 0.5 dB steps
-        return min(max(stepped, range.lowerBound), range.upperBound)
+        return clampStep(range.lowerBound + norm * (range.upperBound - range.lowerBound))
     }
 }
