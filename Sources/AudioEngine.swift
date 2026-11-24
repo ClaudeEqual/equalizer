@@ -34,6 +34,7 @@ final class SystemAudioEQ {
     private var aggregateID = AudioObjectID(kAudioObjectUnknown)
     private var procID: AudioDeviceIOProcID?
     private var rateListener: AudioObjectPropertyListenerBlock?
+    private let ioQueue = DispatchQueue(label: "equalizer.audio", qos: .userInteractive)
 
     func start() throws {
         stop()
@@ -45,7 +46,13 @@ final class SystemAudioEQ {
         sampleRate = Self.nominalSampleRate(outputID) ?? 48_000
 
         // Exclude ourselves from the tap, otherwise our own output would be captured again (feedback).
-        guard let own = Self.ownProcessObject() else { throw EngineError.noOwnProcess }
+        // A process that has never played audio may have no audio object yet: play a moment of silence first.
+        var ownObject = Self.ownProcessObject()
+        if ownObject == nil {
+            Self.registerAsAudioClient(outputID)
+            ownObject = Self.ownProcessObject()
+        }
+        guard let own = ownObject else { throw EngineError.noOwnProcess }
 
         do {
             let tapDescription = CATapDescription(stereoGlobalTapButExcludeProcesses: [own])
@@ -84,7 +91,8 @@ final class SystemAudioEQ {
 
             let processor = self.processor
             var newProc: AudioDeviceIOProcID?
-            status = AudioDeviceCreateIOProcIDWithBlock(&newProc, aggregateID, nil) { _, inInputData, _, outOutputData, _ in
+            // An explicit queue: a nil queue is reported not to work reliably on macOS 26.
+            status = AudioDeviceCreateIOProcIDWithBlock(&newProc, aggregateID, ioQueue) { _, inInputData, _, outOutputData, _ in
                 processor.process(input: inInputData, output: outOutputData)
             }
             guard status == noErr, let proc = newProc else { throw EngineError.os("обработчик звука", status) }
@@ -176,6 +184,22 @@ final class SystemAudioEQ {
         var size = UInt32(MemoryLayout<Float64>.size)
         let status = AudioObjectGetPropertyData(device, &address, 0, nil, &size, &rate)
         return (status == noErr && rate > 0) ? rate : nil
+    }
+
+    /// Plays ~0.15 s of silence so Core Audio registers this app as an audio process.
+    static func registerAsAudioClient(_ device: AudioObjectID) {
+        var proc: AudioDeviceIOProcID?
+        let queue = DispatchQueue(label: "equalizer.prime")
+        let status = AudioDeviceCreateIOProcIDWithBlock(&proc, device, queue) { _, _, _, outOutputData, _ in
+            for buf in UnsafeMutableAudioBufferListPointer(outOutputData) {
+                if let data = buf.mData { memset(data, 0, Int(buf.mDataByteSize)) }
+            }
+        }
+        guard status == noErr, let p = proc else { return }
+        AudioDeviceStart(device, p)
+        usleep(150_000)
+        AudioDeviceStop(device, p)
+        AudioDeviceDestroyIOProcID(device, p)
     }
 
     static func ownProcessObject() -> AudioObjectID? {
