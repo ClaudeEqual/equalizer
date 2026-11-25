@@ -7,13 +7,13 @@ struct EqualizerApp: App {
     var body: some Scene {
         // Resizable main window: can be stretched or opened full screen (green button).
         Window("Эквалайзер", id: "main") {
-            EqualizerView(model: model, fillsWindow: true)
+            EqualizerView(model: model)
         }
-        .defaultSize(width: 640, height: 760)
+        .defaultSize(width: 1120, height: 820)
         .windowResizability(.contentMinSize)
 
         MenuBarExtra {
-            EqualizerView(model: model, showsQuit: true)
+            MenuBarView(model: model)
         } label: {
             Image(systemName: model.isOn ? "slider.vertical.3" : "speaker.slash")
         }
