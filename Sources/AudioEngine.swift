@@ -87,7 +87,7 @@ final class SystemAudioEQ {
             guard status == noErr else { throw EngineError.os("аудиоустройство", status) }
             aggregateID = newAggregate
 
-            processor.prepare(sampleRate: sampleRate)
+            processor.prepare()
 
             let processor = self.processor
             var newProc: AudioDeviceIOProcID?
