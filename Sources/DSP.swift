@@ -4,21 +4,25 @@ import os
 
 // MARK: - Biquad filter math (RBJ Audio EQ Cookbook)
 
-struct BiquadCoefficients {
+struct BiquadCoefficients: Equatable {
     var b0: Double, b1: Double, b2: Double, a1: Double, a2: Double
     static let identity = BiquadCoefficients(b0: 1, b1: 0, b2: 0, a1: 0, a2: 0)
 }
 
-enum FilterKind { case lowShelf, peak, highShelf }
+enum FilterKind: String, Codable, CaseIterable {
+    case peak, lowShelf, highShelf, highPass, lowPass
+}
 
 func makeBiquad(kind: FilterKind, frequency: Double, gainDB: Double, q: Double, sampleRate: Double) -> BiquadCoefficients {
-    if abs(gainDB) < 0.01 || sampleRate <= 0 { return .identity }
+    guard sampleRate > 0 else { return .identity }
+    let usesGain = kind == .peak || kind == .lowShelf || kind == .highShelf
+    if usesGain && abs(gainDB) < 0.01 { return .identity }
     let a = pow(10.0, gainDB / 40.0)
-    let freq = min(frequency, sampleRate * 0.45)
+    let freq = min(max(frequency, 5), sampleRate * 0.45)
     let w0 = 2.0 * Double.pi * freq / sampleRate
     let cosw = cos(w0)
     let sinw = sin(w0)
-    let alpha = sinw / (2.0 * q)
+    let alpha = sinw / (2.0 * max(q, 0.05))
 
     var b0 = 1.0, b1 = 0.0, b2 = 0.0, a0 = 1.0, a1 = 0.0, a2 = 0.0
     switch kind {
@@ -45,28 +49,69 @@ func makeBiquad(kind: FilterKind, frequency: Double, gainDB: Double, q: Double, 
         a0 = (a + 1) - (a - 1) * cosw + sq
         a1 = 2 * ((a - 1) - (a + 1) * cosw)
         a2 = (a + 1) - (a - 1) * cosw - sq
+    case .highPass:
+        b0 = (1 + cosw) / 2
+        b1 = -(1 + cosw)
+        b2 = (1 + cosw) / 2
+        a0 = 1 + alpha
+        a1 = -2 * cosw
+        a2 = 1 - alpha
+    case .lowPass:
+        b0 = (1 - cosw) / 2
+        b1 = 1 - cosw
+        b2 = (1 - cosw) / 2
+        a0 = 1 + alpha
+        a1 = -2 * cosw
+        a2 = 1 - alpha
     }
     return BiquadCoefficients(b0: b0 / a0, b1: b1 / a0, b2: b2 / a0, a1: a1 / a0, a2: a2 / a0)
 }
 
+/// Combined level (dB) of a chain of filters at frequency f.
+func responseDB(_ filters: [BiquadCoefficients], at f: Double, sampleRate sr: Double) -> Double {
+    let w = 2 * Double.pi * min(f, sr * 0.49) / sr
+    let c1 = cos(w), s1 = -sin(w), c2 = cos(2 * w), s2 = -sin(2 * w)
+    var power = 1.0
+    for k in filters {
+        let nr = k.b0 + k.b1 * c1 + k.b2 * c2
+        let ni = k.b1 * s1 + k.b2 * s2
+        let dr = 1 + k.a1 * c1 + k.a2 * c2
+        let di = k.a1 * s1 + k.a2 * s2
+        power *= (nr * nr + ni * ni) / max(dr * dr + di * di, 1e-30)
+    }
+    return 10 * log10(max(power, 1e-30))
+}
+
 // MARK: - Real-time processor
 
-/// Stereo 10-band EQ + auto preamp + peak limiter.
+/// Stereo chain: up to 64 filters + harmonic bass enhancer + output gain + protection (off = hard clip, soft = soft clip).
 /// `process` runs on the Core Audio real-time thread: no allocations, no blocking locks.
 final class EQProcessor {
-    static let bands = 10
-    private static let paramCount = bands * 5 + 1 // 5 coefficients per band + preamp (linear)
+    static let maxFilters = 64
+    static let enhancerFilters = 4
+    static let spectrumSize = 4096
+
+    // Parameter layout: [0] filter count, [1] output gain (linear), [2] bass power 0...1, [3] protection (0 off, 1 soft),
+    // then maxFilters * 5 coefficients, then enhancerFilters * 5 coefficients.
+    private static let headerCount = 4
+    private static let chainOffset = headerCount
+    private static let enhancerOffset = headerCount + maxFilters * 5
+    private static let paramCount = enhancerOffset + enhancerFilters * 5
+    private static let chainStateCount = 2 * maxFilters * 2
+    private static let enhancerStateCount = enhancerFilters * 2
 
     private let lock: UnsafeMutablePointer<os_unfair_lock>
     private let pending: UnsafeMutablePointer<Double>
     private let pendingFlag: UnsafeMutablePointer<Bool>
     private let target: UnsafeMutablePointer<Double>
     private let current: UnsafeMutablePointer<Double>
-    private let state: UnsafeMutablePointer<Double>   // [channel][band][z1, z2]
-    private let misc: UnsafeMutablePointer<Double>    // [0] limiter gain, [1] limiter release coefficient
-
-    private static let stateCount = 2 * bands * 2
-    private static let limiterThreshold = 0.977 // about -0.2 dBFS
+    private let chainState: UnsafeMutablePointer<Double>
+    private let enhState: UnsafeMutablePointer<Double>
+    private let bypassFlag: UnsafeMutablePointer<Bool>
+    /// [0] decaying peak level (linear, before protection), [1] number of samples that went over full scale
+    private let meters: UnsafeMutablePointer<Double>
+    private let ring: UnsafeMutablePointer<Float>
+    private let ringIndex: UnsafeMutablePointer<Int>
 
     init() {
         lock = .allocate(capacity: 1)
@@ -79,15 +124,21 @@ final class EQProcessor {
         target.initialize(repeating: 0, count: Self.paramCount)
         current = .allocate(capacity: Self.paramCount)
         current.initialize(repeating: 0, count: Self.paramCount)
-        state = .allocate(capacity: Self.stateCount)
-        state.initialize(repeating: 0, count: Self.stateCount)
-        misc = .allocate(capacity: 2)
-        misc.initialize(repeating: 0, count: 2)
+        chainState = .allocate(capacity: Self.chainStateCount)
+        chainState.initialize(repeating: 0, count: Self.chainStateCount)
+        enhState = .allocate(capacity: Self.enhancerStateCount)
+        enhState.initialize(repeating: 0, count: Self.enhancerStateCount)
+        bypassFlag = .allocate(capacity: 1)
+        bypassFlag.initialize(to: false)
+        meters = .allocate(capacity: 2)
+        meters.initialize(repeating: 0, count: 2)
+        ring = .allocate(capacity: Self.spectrumSize)
+        ring.initialize(repeating: 0, count: Self.spectrumSize)
+        ringIndex = .allocate(capacity: 1)
+        ringIndex.initialize(to: 0)
 
-        Self.writeIdentity(into: target)
-        Self.writeIdentity(into: current)
-        misc[0] = 1
-        misc[1] = 1 - exp(-1 / (0.2 * 48_000))
+        Self.writeDefaults(into: target)
+        Self.writeDefaults(into: current)
     }
 
     deinit {
@@ -96,35 +147,70 @@ final class EQProcessor {
         pendingFlag.deallocate()
         target.deallocate()
         current.deallocate()
-        state.deallocate()
-        misc.deallocate()
+        chainState.deallocate()
+        enhState.deallocate()
+        bypassFlag.deallocate()
+        meters.deallocate()
+        ring.deallocate()
+        ringIndex.deallocate()
     }
 
-    private static func writeIdentity(into p: UnsafeMutablePointer<Double>) {
-        for b in 0..<bands {
-            let o = b * 5
-            p[o] = 1; p[o + 1] = 0; p[o + 2] = 0; p[o + 3] = 0; p[o + 4] = 0
+    private static func writeDefaults(into p: UnsafeMutablePointer<Double>) {
+        for i in 0..<paramCount { p[i] = 0 }
+        p[1] = 1
+        for b in 0..<(maxFilters + enhancerFilters) {
+            p[chainOffset + b * 5] = 1
         }
-        p[bands * 5] = 1
     }
 
-    /// Called from the main thread whenever the user changes something.
-    func setParameters(_ coeffs: [BiquadCoefficients], preampDB: Double) {
+    // MARK: Main-thread API
+
+    func setParameters(filters: [BiquadCoefficients], enhancer: [BiquadCoefficients],
+                       outputGainDB: Double, bassPower: Double, softProtection: Bool) {
+        let count = min(filters.count, Self.maxFilters)
         os_unfair_lock_lock(lock)
-        for b in 0..<Self.bands {
-            let c = b < coeffs.count ? coeffs[b] : .identity
-            let o = b * 5
+        pending[0] = Double(count)
+        pending[1] = pow(10.0, outputGainDB / 20.0)
+        pending[2] = min(max(bassPower, 0), 1)
+        pending[3] = softProtection ? 1 : 0
+        for b in 0..<Self.maxFilters {
+            let c = b < count ? filters[b] : .identity
+            let o = Self.chainOffset + b * 5
             pending[o] = c.b0; pending[o + 1] = c.b1; pending[o + 2] = c.b2
             pending[o + 3] = c.a1; pending[o + 4] = c.a2
         }
-        pending[Self.bands * 5] = pow(10.0, preampDB / 20.0)
+        for b in 0..<Self.enhancerFilters {
+            let c = b < enhancer.count ? enhancer[b] : .identity
+            let o = Self.enhancerOffset + b * 5
+            pending[o] = c.b0; pending[o + 1] = c.b1; pending[o + 2] = c.b2
+            pending[o + 3] = c.a1; pending[o + 4] = c.a2
+        }
         pendingFlag.pointee = true
         os_unfair_lock_unlock(lock)
     }
 
+    /// While true the sound passes untouched (the "compare" button).
+    func setBypass(_ on: Bool) { bypassFlag.pointee = on }
+
+    /// Peak level in dB (before protection) and the total number of samples that went over full scale.
+    func readMeters() -> (peakDB: Double, clips: Int) {
+        let peak = meters[0]
+        return (peak > 1e-6 ? 20 * log10(peak) : -120, Int(meters[1]))
+    }
+
+    /// Copies the latest `count` output samples (mono) for the spectrum display.
+    func copyRecentSamples(into out: inout [Float]) {
+        let n = min(out.count, Self.spectrumSize)
+        let end = ringIndex.pointee
+        for i in 0..<n {
+            out[i] = ring[(end - n + i + Self.spectrumSize) & (Self.spectrumSize - 1)]
+        }
+    }
+
     /// Called before audio starts (never while `process` is running).
-    func prepare(sampleRate: Double) {
-        for i in 0..<Self.stateCount { state[i] = 0 }
+    func prepare() {
+        for i in 0..<Self.chainStateCount { chainState[i] = 0 }
+        for i in 0..<Self.enhancerStateCount { enhState[i] = 0 }
         os_unfair_lock_lock(lock)
         if pendingFlag.pointee {
             for i in 0..<Self.paramCount { target[i] = pending[i] }
@@ -132,8 +218,18 @@ final class EQProcessor {
         }
         os_unfair_lock_unlock(lock)
         for i in 0..<Self.paramCount { current[i] = target[i] }
-        misc[0] = 1
-        misc[1] = 1 - exp(-1 / (0.2 * max(sampleRate, 8_000)))
+        meters[0] = 0
+    }
+
+    // MARK: Real-time
+
+    @inline(__always)
+    private static func softClip(_ x: Double) -> Double {
+        let t = 0.6
+        let a = abs(x)
+        if a <= t { return x }
+        let y = t + (1 - t) * tanh((a - t) / (1 - t))
+        return x < 0 ? -y : y
     }
 
     func process(input: UnsafePointer<AudioBufferList>, output: UnsafeMutablePointer<AudioBufferList>) {
@@ -145,9 +241,15 @@ final class EQProcessor {
             }
             os_unfair_lock_unlock(lock)
         }
-        // Smoothly glide towards the new settings (no clicks).
-        for i in 0..<Self.paramCount {
-            current[i] += (target[i] - current[i]) * 0.35
+        if Int(target[0]) != Int(current[0]) {
+            // The chain changed shape (another band count or mode): switch at once and start clean.
+            for i in 0..<Self.paramCount { current[i] = target[i] }
+            for i in 0..<Self.chainStateCount { chainState[i] = 0 }
+        } else {
+            // Glide towards the new settings (no clicks).
+            current[3] = target[3]
+            for i in 1..<3 { current[i] += (target[i] - current[i]) * 0.35 }
+            for i in Self.headerCount..<Self.paramCount { current[i] += (target[i] - current[i]) * 0.35 }
         }
 
         let inList = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: input))
@@ -199,49 +301,87 @@ final class EQProcessor {
         }
         guard let oL = outL, let iL = inL, let iR = inR else { return }
 
-        let bands = Self.bands
-        let pre = current[bands * 5]
-        let release = misc[1]
-        var gain = misc[0]
-        let threshold = Self.limiterThreshold
-        let rightStateOffset = bands * 2
+        let count = min(Int(current[0]), Self.maxFilters)
+        let gain = current[1]
+        let power = current[2]
+        let soft = current[3] > 0.5
+        let bypass = bypassFlag.pointee
+        let rightOffset = Self.maxFilters * 2
+        let eo = Self.enhancerOffset
+        var peak = meters[0] * 0.9
+        var clips = meters[1]
+        var idx = ringIndex.pointee
 
         for f in 0..<outFrames {
             var l = 0.0, r = 0.0
             if f < inFrames {
-                l = Double(iL[f * inLStride]) * pre
-                r = Double(iR[f * inRStride]) * pre
+                l = Double(iL[f * inLStride])
+                r = Double(iR[f * inRStride])
             }
 
-            for b in 0..<bands {
-                let o = b * 5
-                let b0 = current[o], b1 = current[o + 1], b2 = current[o + 2]
-                let a1 = current[o + 3], a2 = current[o + 4]
+            if !bypass {
+                // Harmonic bass enhancer: takes the lowest bass, adds its overtones so it is felt even on small drivers.
+                var enh = 0.0
+                if power > 0.001 {
+                    var m = (l + r) * 0.5
+                    for k in 0..<4 {
+                        let o = eo + k * 5
+                        let s = k * 2
+                        let y = current[o] * m + enhState[s]
+                        enhState[s] = current[o + 1] * m - current[o + 3] * y + enhState[s + 1]
+                        enhState[s + 1] = current[o + 2] * m - current[o + 4] * y
+                        m = y
+                        if k == 1 {
+                            // after the two low-pass stages: generate harmonics
+                            m = tanh(3 * m) + 0.5 * tanh(3 * abs(m))
+                        }
+                    }
+                    enh = m * power * 1.5
+                }
 
-                let sl = b * 2
-                let yl = b0 * l + state[sl]
-                state[sl] = b1 * l - a1 * yl + state[sl + 1]
-                state[sl + 1] = b2 * l - a2 * yl
-                l = yl
+                for b in 0..<count {
+                    let o = Self.chainOffset + b * 5
+                    let b0 = current[o], b1 = current[o + 1], b2 = current[o + 2]
+                    let a1 = current[o + 3], a2 = current[o + 4]
 
-                let sr = rightStateOffset + b * 2
-                let yr = b0 * r + state[sr]
-                state[sr] = b1 * r - a1 * yr + state[sr + 1]
-                state[sr + 1] = b2 * r - a2 * yr
-                r = yr
+                    let sl = b * 2
+                    let yl = b0 * l + chainState[sl]
+                    chainState[sl] = b1 * l - a1 * yl + chainState[sl + 1]
+                    chainState[sl + 1] = b2 * l - a2 * yl
+                    l = yl
+
+                    let sr = rightOffset + b * 2
+                    let yr = b0 * r + chainState[sr]
+                    chainState[sr] = b1 * r - a1 * yr + chainState[sr + 1]
+                    chainState[sr + 1] = b2 * r - a2 * yr
+                    r = yr
+                }
+
+                l = (l + enh) * gain
+                r = (r + enh) * gain
+
+                if !(l.isFinite && r.isFinite) {
+                    for i in 0..<Self.chainStateCount { chainState[i] = 0 }
+                    for i in 0..<Self.enhancerStateCount { enhState[i] = 0 }
+                    l = 0; r = 0
+                }
+
+                let p = max(abs(l), abs(r))
+                if p > peak { peak = p }
+                if p > 1 { clips += 1 }
+
+                if soft {
+                    l = Self.softClip(l)
+                    r = Self.softClip(r)
+                } else {
+                    // No limits: anything over full scale is simply cut off (audible distortion, by choice).
+                    l = min(max(l, -1), 1)
+                    r = min(max(r, -1), 1)
+                }
             }
 
-            if !(l.isFinite && r.isFinite) {
-                for i in 0..<Self.stateCount { state[i] = 0 }
-                l = 0; r = 0
-            }
-
-            // Peak limiter: instant attack, smooth release.
-            let peak = max(abs(l), abs(r))
-            gain += (1 - gain) * release
-            if peak * gain > threshold { gain = threshold / peak }
-            l *= gain
-            r *= gain
+            ring[idx] = Float((l + r) * 0.5)
+            idx = (idx + 1) & (Self.spectrumSize - 1)
 
             if let oR = outR {
                 oL[f * outLStride] = Float(l)
@@ -250,6 +390,8 @@ final class EQProcessor {
                 oL[f * outLStride] = Float((l + r) * 0.5)
             }
         }
-        misc[0] = gain
+        meters[0] = peak
+        meters[1] = clips
+        ringIndex.pointee = idx
     }
 }
